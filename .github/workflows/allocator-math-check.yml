@@ -1,43 +1,58 @@
 
-name: PHP Allocator Math Check
+name: PHP Allocator Source Check
 
 on:
   workflow_dispatch:
 
 jobs:
-  overflow-math:
+  source-check:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout PHP source
         uses: actions/checkout@v4
 
-      - name: Test alignment overflow
+      - name: Check allocator functions
         run: |
-          cat > /tmp/check.c <<'EOF'
-          #include <stdint.h>
-          #include <stddef.h>
-          #include <stdio.h>
+          python3 - <<'PY'
+          from pathlib import Path
 
-          int main(void) {
-              size_t size = SIZE_MAX;
-              size_t alignment = 4096;
+          source = Path("Zend/zend_alloc.c").read_text()
 
-              size_t result =
-                  (size + (alignment - 1)) & ~(alignment - 1);
+          def get_function(name):
+              start = source.find(name)
+              if start < 0:
+                  raise RuntimeError(f"{name} not found")
 
-              printf("Original size: %zu\n", size);
-              printf("Aligned size: %zu\n", result);
+              opening = source.find("{", start)
+              depth = 0
 
-              if (result == 0) {
-                  puts("RESULT: Alignment overflow reproduced.");
-                  return 0;
-              }
+              for i in range(opening, len(source)):
+                  if source[i] == "{":
+                      depth += 1
+                  elif source[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return source[opening:i + 1]
 
-              puts("RESULT: Expected overflow was not reproduced.");
-              return 1;
-          }
-          EOF
+              raise RuntimeError(f"Could not read {name}")
 
-          gcc -Wall -Wextra -o /tmp/check /tmp/check.c
-          /tmp/check
+          realloc_code = get_function("zend_mm_realloc_huge")
+          alloc_code = get_function("zend_mm_alloc_huge")
+
+          realloc_guard = "new_size < size" in realloc_code
+          alloc_guard = "new_size < size" in alloc_code
+
+          print("PHP allocator source check")
+          print("Realloc overflow guard:", realloc_guard)
+          print("Alloc overflow guard:", alloc_guard)
+
+          if alloc_guard and not realloc_guard:
+              print("RESULT: Candidate missing-check pattern found.")
+              print("NOTE: This is source inspection, not runtime proof.")
+          elif alloc_guard and realloc_guard:
+              print("RESULT: Both functions contain the check.")
+          else:
+              print("RESULT: Expected source pattern not found.")
+              raise SystemExit(1)
+          PY
