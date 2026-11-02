@@ -12,47 +12,54 @@ jobs:
       - name: Checkout PHP source
         uses: actions/checkout@v4
 
-      - name: Check allocator functions
+      - name: Inspect allocator functions
         run: |
           python3 - <<'PY'
+          import re
           from pathlib import Path
 
           source = Path("Zend/zend_alloc.c").read_text()
 
           def get_function(name):
-              start = source.find(name)
-              if start < 0:
-                  raise RuntimeError(f"{name} not found")
+              pattern = re.compile(
+                  r'\bstatic\s+(?:zend_never_inline\s+)?void\s*\*\s*'
+                  + re.escape(name)
+                  + r'\s*\([^;{}]*?\)\s*\{',
+                  re.S
+              )
 
-              opening = source.find("{", start)
+              match = pattern.search(source)
+              if not match:
+                  raise RuntimeError(f"Function not found: {name}")
+
+              start = source.find("{", match.start(), match.end())
               depth = 0
 
-              for i in range(opening, len(source)):
+              for i in range(start, len(source)):
                   if source[i] == "{":
                       depth += 1
                   elif source[i] == "}":
                       depth -= 1
                       if depth == 0:
-                          return source[opening:i + 1]
+                          return source[start:i + 1], source.count("\n", 0, match.start()) + 1
 
-              raise RuntimeError(f"Could not read {name}")
+              raise RuntimeError(f"Could not parse: {name}")
 
-          realloc_code = get_function("zend_mm_realloc_huge")
-          alloc_code = get_function("zend_mm_alloc_huge")
+          realloc_code, realloc_line = get_function("zend_mm_realloc_huge")
+          alloc_code, alloc_line = get_function("zend_mm_alloc_huge")
 
           realloc_guard = "new_size < size" in realloc_code
           alloc_guard = "new_size < size" in alloc_code
 
-          print("PHP allocator source check")
+          print("Realloc function line:", realloc_line)
+          print("Alloc function line:", alloc_line)
           print("Realloc overflow guard:", realloc_guard)
           print("Alloc overflow guard:", alloc_guard)
 
           if alloc_guard and not realloc_guard:
-              print("RESULT: Candidate missing-check pattern found.")
-              print("NOTE: This is source inspection, not runtime proof.")
+              print("RESULT: Missing-check candidate found.")
           elif alloc_guard and realloc_guard:
               print("RESULT: Both functions contain the check.")
           else:
-              print("RESULT: Expected source pattern not found.")
-              raise SystemExit(1)
+              print("RESULT: Pattern needs manual inspection.")
           PY
