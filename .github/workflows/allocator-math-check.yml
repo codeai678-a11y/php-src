@@ -1,0 +1,43 @@
+
+name: PHP Allocator Math Check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  overflow-math:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Test alignment overflow
+        run: |
+          cat > /tmp/check.c <<'EOF'
+          #include <stdint.h>
+          #include <stddef.h>
+          #include <stdio.h>
+
+          int main(void) {
+              size_t size = SIZE_MAX;
+              size_t alignment = 4096;
+
+              size_t result =
+                  (size + (alignment - 1)) & ~(alignment - 1);
+
+              printf("Original size: %zu\n", size);
+              printf("Aligned size: %zu\n", result);
+
+              if (result == 0) {
+                  puts("RESULT: Alignment overflow reproduced.");
+                  return 0;
+              }
+
+              puts("RESULT: Expected overflow was not reproduced.");
+              return 1;
+          }
+          EOF
+
+          gcc -Wall -Wextra -o /tmp/check /tmp/check.c
+          /tmp/check
