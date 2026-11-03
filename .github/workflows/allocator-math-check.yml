@@ -21,26 +21,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf bison re2c pkg-config libxml2-dev
 
-      - name: Build minimal PHP CLI
+      - name: Build PHP CLI
         run: |
           ./buildconf --force
           ./configure --disable-all --enable-cli --without-pear
           make -j2
 
-      - name: Create isolated allocator probe extension
+      - name: Create isolated probe extension
         run: |
           cat > /tmp/allocator_probe.c <<'C'
           #include "php.h"
+          #include <unistd.h>
 
           PHP_FUNCTION(allocator_size_max_probe)
           {
               void *ptr = emalloc(4 * 1024 * 1024);
+
+              write(2, "ALLOCATED\n", 10);
+              write(2, "BEFORE_EREALLOC\n", 16);
+
               void *resized = erealloc(ptr, (size_t)-1);
 
-              volatile unsigned char value =
-                  *((volatile unsigned char *) resized);
+              (void) resized;
 
-              RETURN_LONG(value);
+              write(2, "AFTER_EREALLOC\n", 15);
+
+              _exit(0);
           }
 
           static const zend_function_entry probe_functions[] = {
@@ -83,9 +89,9 @@ jobs:
           echo "PHP_EXIT_CODE=$status"
 
           if [ "$status" -eq 139 ]; then
-            echo "RESULT: PHP received SIGSEGV during the probe."
+            echo "RESULT: Crash during or before erealloc returned."
           elif [ "$status" -eq 0 ]; then
-            echo "RESULT: Probe completed without a crash."
+            echo "RESULT: erealloc returned; process exited safely."
           else
             echo "RESULT: INCONCLUSIVE. Exit code: $status"
           fi
