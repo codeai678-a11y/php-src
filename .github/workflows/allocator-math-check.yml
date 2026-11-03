@@ -1,5 +1,5 @@
 
-name: PHP Allocator Runtime Probe
+name: PHP Allocator Memory Mapping Test
 
 on:
   workflow_dispatch:
@@ -8,13 +8,16 @@ permissions:
   contents: read
 
 jobs:
-  runtime-probe:
+  mapping-test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
       - name: Checkout PHP source
         uses: actions/checkout@v4
+
+      - name: Record source commit
+        run: git rev-parse HEAD
 
       - name: Install build requirements
         run: |
@@ -27,30 +30,55 @@ jobs:
           ./configure --disable-all --enable-cli --without-pear
           make -j2
 
-      - name: Create isolated probe extension
+      - name: Create memory mapping probe
         run: |
           cat > /tmp/allocator_probe.c <<'C'
           #include "php.h"
           #include <unistd.h>
+          #include <sys/mman.h>
+          #include <stdint.h>
+          #include <errno.h>
+
+          ZEND_BEGIN_ARG_INFO_EX(arginfo_probe, 0, 0, 0)
+          ZEND_END_ARG_INFO()
 
           PHP_FUNCTION(allocator_size_max_probe)
           {
               void *ptr = emalloc(4 * 1024 * 1024);
-
               write(2, "ALLOCATED\n", 10);
-              write(2, "BEFORE_EREALLOC\n", 16);
 
               void *resized = erealloc(ptr, (size_t)-1);
+              write(2, "EREALLOC_RETURNED\n", 18);
 
-              (void) resized;
+              long page_size = sysconf(_SC_PAGESIZE);
+              if (page_size <= 0) {
+                  write(2, "RESULT: PAGE_SIZE_ERROR\n", 24);
+                  _exit(2);
+              }
 
-              write(2, "AFTER_EREALLOC\n", 15);
+              uintptr_t address = (uintptr_t) resized;
+              uintptr_t page = address & ~((uintptr_t)page_size - 1);
+              unsigned char vec = 0;
+
+              int result = mincore(
+                  (void *)page,
+                  (size_t)page_size,
+                  &vec
+              );
+
+              if (result == 0) {
+                  write(2, "RESULT: MAPPING_PRESENT\n", 24);
+              } else if (errno == ENOMEM) {
+                  write(2, "RESULT: MAPPING_ABSENT\n", 23);
+              } else {
+                  write(2, "RESULT: MINCORE_INCONCLUSIVE\n", 29);
+              }
 
               _exit(0);
           }
 
           static const zend_function_entry probe_functions[] = {
-              PHP_FE(allocator_size_max_probe, NULL)
+              PHP_FE(allocator_size_max_probe, arginfo_probe)
               PHP_FE_END
           };
 
@@ -74,7 +102,7 @@ jobs:
             /tmp/allocator_probe.c \
             -o /tmp/allocator_probe.so
 
-      - name: Run isolated runtime test
+      - name: Run isolated mapping test
         run: |
           set +e
           ulimit -c 0
@@ -87,11 +115,4 @@ jobs:
           set -e
 
           echo "PHP_EXIT_CODE=$status"
-
-          if [ "$status" -eq 139 ]; then
-            echo "RESULT: Crash during or before erealloc returned."
-          elif [ "$status" -eq 0 ]; then
-            echo "RESULT: erealloc returned; process exited safely."
-          else
-            echo "RESULT: INCONCLUSIVE. Exit code: $status"
-          fi
+          echo "Mapping test finished."
