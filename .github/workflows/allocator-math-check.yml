@@ -1,45 +1,91 @@
 
-name: PHP Allocator Truncate Check
+name: PHP Allocator Runtime Probe
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  truncate-check:
+  runtime-probe:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout PHP source
         uses: actions/checkout@v4
 
-      - name: Inspect truncate function
+      - name: Install build requirements
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf bison re2c pkg-config libxml2-dev
 
-          source = Path("Zend/zend_alloc.c").read_text()
+      - name: Build minimal PHP CLI
+        run: |
+          ./buildconf --force
+          ./configure --disable-all --enable-cli --without-pear
+          make -j2
 
-          start = source.find("zend_mm_chunk_truncate(")
-          if start < 0:
-              raise SystemExit("Function not found")
+      - name: Create isolated allocator probe extension
+        run: |
+          cat > /tmp/allocator_probe.c <<'C'
+          #include "php.h"
 
-          opening = source.find("{", start)
-          depth = 0
+          PHP_FUNCTION(allocator_size_max_probe)
+          {
+              void *ptr = emalloc(4 * 1024 * 1024);
+              void *resized = erealloc(ptr, (size_t)-1);
 
-          for i in range(opening, len(source)):
-              if source[i] == "{":
-                  depth += 1
-              elif source[i] == "}":
-                  depth -= 1
-                  if depth == 0:
-                      code = source[opening:i + 1]
-                      break
-          else:
-              raise SystemExit("Could not parse function")
+              volatile unsigned char value =
+                  *((volatile unsigned char *) resized);
 
-          print("TRUNCATE FUNCTION:")
-          print(code)
+              RETURN_LONG(value);
+          }
 
-          print("\nLinux munmap present:", "zend_mm_munmap" in code)
-          print("Old size minus new size:", "old_size - new_size" in code)
-          PY
+          static const zend_function_entry probe_functions[] = {
+              PHP_FE(allocator_size_max_probe, NULL)
+              PHP_FE_END
+          };
+
+          zend_module_entry allocator_probe_module_entry = {
+              STANDARD_MODULE_HEADER,
+              "allocator_probe",
+              probe_functions,
+              NULL, NULL, NULL, NULL, NULL,
+              "0.1.0",
+              STANDARD_MODULE_PROPERTIES
+          };
+
+          #ifdef COMPILE_DL_ALLOCATOR_PROBE
+          ZEND_GET_MODULE(allocator_probe)
+          #endif
+          C
+
+          cc -shared -fPIC \
+            -DCOMPILE_DL_ALLOCATOR_PROBE=1 \
+            -I. -Imain -IZend -ITSRM -Iext \
+            /tmp/allocator_probe.c \
+            -o /tmp/allocator_probe.so
+
+      - name: Run isolated runtime test
+        run: |
+          set +e
+          ulimit -c 0
+
+          sapi/cli/php -n \
+            -d extension=/tmp/allocator_probe.so \
+            -r 'allocator_size_max_probe();'
+
+          status=$?
+          set -e
+
+          echo "PHP_EXIT_CODE=$status"
+
+          if [ "$status" -eq 139 ]; then
+            echo "RESULT: PHP received SIGSEGV during the probe."
+          elif [ "$status" -eq 0 ]; then
+            echo "RESULT: Probe completed without a crash."
+          else
+            echo "RESULT: INCONCLUSIVE. Exit code: $status"
+          fi
